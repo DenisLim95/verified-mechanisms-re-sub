@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "set": "dev8",
+  "problems": [
+    {
+      "id": "p05_gcd_mersenne",
+      "theorem_names": ["p05_gcd_mersenne"],
+      "definition_names": [],
+      "numeric_answer_names": []
+    },
+    {
+      "id": "p06_pow_mod",
+      "theorem_names": ["p06_pow_mod"],
+      "definition_names": ["p06_answer"],
+      "numeric_answer_names": ["p06_answer"]
+    },
+    {
+      "id": "p08_sum_products",
+      "theorem_names": ["p08_sum_products"],
+      "definition_names": [],
+      "numeric_answer_names": []
+    },
+    {
+      "id": "putnam_2020_a2",
+      "theorem_names": ["putnam_2020_a2"],
+      "definition_names": ["putnam_2020_a2_solution"],
+      "numeric_answer_names": []
+    },
+    {
+      "id": "p09_imo1964",
+      "theorem_names": ["p09_a", "p09_b"],
+      "definition_names": [],
+      "numeric_answer_names": []
+    },
+    {
+      "id": "p10_factorial_pow",
+      "theorem_names": ["p10_factorial_pow"],
+      "definition_names": ["p10_answer"],
+      "numeric_answer_names": ["p10_answer"]
+    },
+    {
+      "id": "rmo_2000_2",
+      "theorem_names": ["rmo_2000_2"],
+      "definition_names": [],
+      "numeric_answer_names": []
+    },
+    {
+      "id": "rmo_2001_2",
+      "theorem_names": ["rmo_2001_2"],
+      "definition_names": [],
+      "numeric_answer_names": []
+    }
+  ]
+}
