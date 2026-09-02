@@ -56,12 +56,25 @@ DEBUGGER = MODEL_A  # qwen/qwen3.5-flash-02-23 — fast local error repair
 MAX_REPAIRS = 5
 MAX_ESCALATIONS = 2
 
-DRAFT_MAX_TOKENS = 16000
-DEBUG_MAX_TOKENS = 12000
+# A reasoning model bills its hidden thinking against `max_tokens`, so a file
+# that needs a few thousand tokens still needs an allowance several times that
+# to survive the thinking. Undersized allowances do not truncate the answer;
+# they consume the whole budget before the answer starts and return nothing.
+DRAFT_MAX_TOKENS = 32000
+DEBUG_MAX_TOKENS = 24000
 ANSWER_MAX_TOKENS = 8000
 DRAFT_TEMPERATURE = 0.2
 DEBUG_TEMPERATURE = 0.1
-REASONER_EFFORT = "high"
+
+# Effort trades thinking against the tokens left for output. Writing a whole
+# Lean file needs the output room; naming a numeric answer is a short reply
+# whose only cost is the thinking, so it can afford the highest setting.
+REASONER_EFFORT = "medium"
+ANSWER_EFFORT = "high"
+_EFFORT_LADDER = ("high", "medium", "low")
+
+# An empty completion is retried once at lower effort before the stage gives up.
+EMPTY_RESPONSE_RETRIES = 1
 
 # Per-problem hard cap is $1.00 (RULES.md). Stop opening new calls with margin
 # to spare, since the ledger also reserves a conservative amount per request.
@@ -88,6 +101,16 @@ _LEAN_FENCE_RE = re.compile(r"```(?:lean|lean4)?\s*\n(.*?)```", re.DOTALL | re.I
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
+
+
+def _lower_effort(effort: str) -> str:
+    """The next weaker reasoning setting, leaving more room for the answer."""
+
+    try:
+        index = _EFFORT_LADDER.index(effort)
+    except ValueError:
+        return _EFFORT_LADDER[-1]
+    return _EFFORT_LADDER[min(index + 1, len(_EFFORT_LADDER) - 1)]
 
 
 def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
@@ -610,6 +633,8 @@ class _Session:
         self.spent_usd = 0.0
         self.halted = False
         self.calls = 0
+        self.empty_responses = 0
+        self.truncated_responses = 0
         self.models: set[str] = set()
         self.trace: list[dict[str, Any]] = []
         self.best_accepted: str | None = None
@@ -659,17 +684,69 @@ class _Session:
         max_tokens: int,
         temperature: float,
         reasoning: bool = False,
+        effort: str | None = None,
         seed: int | None = None,
     ) -> str | None:
-        """One budgeted model call. Returns None once the session is spent."""
+        """One budgeted model call. Returns None once the session is spent.
+
+        A reasoning model that spends its whole allowance thinking returns an
+        empty completion. At the call site that is indistinguishable from a
+        refusal, so the stage skips the model and the failure never reaches the
+        trace. Record it instead, and retry once with weaker reasoning so the
+        allowance goes to the answer.
+        """
+
+        current_effort = effort or REASONER_EFFORT
+        for retry in range(EMPTY_RESPONSE_RETRIES + 1):
+            response = await self._request(
+                model,
+                messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                effort=current_effort if reasoning else None,
+                seed=seed,
+            )
+            if response is None:
+                return None
+
+            if response.finish_reason == "length":
+                self.truncated_responses += 1
+            content = response.content or ""
+            if content.strip():
+                return content
+
+            self.empty_responses += 1
+            self.note(
+                "empty_response",
+                model=model,
+                effort=current_effort if reasoning else None,
+                finish=response.finish_reason,
+                retry=retry,
+            )
+            if retry == EMPTY_RESPONSE_RETRIES or self.exhausted:
+                return None
+            current_effort = _lower_effort(current_effort)
+        return None
+
+    async def _request(
+        self,
+        model: str,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int,
+        temperature: float,
+        effort: str | None,
+        seed: int | None,
+    ) -> Any | None:
+        """The budgeted request itself, retried past recoverable rate limits."""
 
         if self.exhausted:
             self.halted = True
             return None
 
         kwargs: dict[str, Any] = {}
-        if reasoning:
-            kwargs["reasoning"] = {"effort": REASONER_EFFORT}
+        if effort is not None:
+            kwargs["reasoning"] = {"effort": effort}
         if seed is not None:
             kwargs["seed"] = seed
 
@@ -700,7 +777,7 @@ class _Session:
             self.calls += 1
             self.models.add(model)
             self.spent_usd += float(response.usage.get("cost") or 0.0)
-            return response.content
+            return response
         return None
 
     async def compile(self, source: str) -> Any | None:
@@ -803,7 +880,12 @@ async def _agree_on_answers(session: _Session) -> None:
     messages = _answer_messages(session.problem, names)
     replies = await asyncio.gather(
         session.complete(
-            REASONER, messages, max_tokens=ANSWER_MAX_TOKENS, temperature=0.2, reasoning=True
+            REASONER,
+            messages,
+            max_tokens=ANSWER_MAX_TOKENS,
+            temperature=0.2,
+            reasoning=True,
+            effort=ANSWER_EFFORT,
         ),
         session.complete(
             DEBUGGER, messages, max_tokens=ANSWER_MAX_TOKENS, temperature=0.2
@@ -827,6 +909,7 @@ async def _agree_on_answers(session: _Session) -> None:
                     max_tokens=ANSWER_MAX_TOKENS,
                     temperature=0.2,
                     reasoning=model == REASONER,
+                    effort=ANSWER_EFFORT,
                 )
                 for model in (REASONER, DEBUGGER)
             )
@@ -874,18 +957,24 @@ async def _draft_portfolio(session: _Session, round_index: int) -> list[_Candida
     # Identical drafts are common at low temperature; compiling one is enough.
     sources: list[tuple[str, str]] = []
     seen: set[str] = set()
+    unusable = 0
     for spec, text in zip(specs, drafts):
-        if not text:
-            continue
-        source = _extract_lean(text, "")
+        source = _extract_lean(text, "") if text else ""
         if not source.strip():
+            unusable += 1
             continue
         key = _normalize(source)
         if key in seen:
             continue
         seen.add(key)
         sources.append((source, spec.model))
-    session.note("portfolio", round=round_index, drafted=len(sources), requested=len(specs))
+    session.note(
+        "portfolio",
+        round=round_index,
+        drafted=len(sources),
+        requested=len(specs),
+        unusable=unusable,
+    )
 
     candidates: list[_Candidate] = []
     for source, author in sources:
@@ -960,7 +1049,9 @@ async def _rewrite(session: _Session, candidate: _Candidate) -> _Candidate | Non
 MAX_SKETCH_ATTEMPTS = 2
 MAX_GAPS = 12
 FILL_MARKER = "«FILL_ME»"
-FILL_MAX_TOKENS = 3000
+# The reply is one tactic line, but the reasoner still thinks first, so the
+# allowance has to cover the thinking rather than the tactic.
+FILL_MAX_TOKENS = 8000
 
 
 def _extract_tactic(text: str) -> str | None:
@@ -999,10 +1090,16 @@ async def _write_skeleton(session: _Session) -> str | None:
             reasoning=True,
         )
         if text is None:
+            session.note("sketch", attempt=attempt, outcome="no_response")
             return None
         source = _extract_lean(text, "")
         if not source.strip():
-            return None
+            session.note("sketch", attempt=attempt, outcome="no_lean_block")
+            feedback = (
+                "Your previous reply contained no Lean code block."
+                " Reply with one complete Lean file and nothing else."
+            )
+            continue
 
         ok, errors = _gate0(session.problem.challenge, source)
         if not ok:
@@ -1082,7 +1179,10 @@ async def _fill_gaps(session: _Session, skeleton: str) -> bool:
 async def _sketch_and_fill(session: _Session) -> bool:
     """Prove a decomposition step by step when whole-file drafting has failed."""
 
-    if not session.config.sketch_fill or session.exhausted:
+    if not session.config.sketch_fill:
+        return False
+    if session.exhausted:
+        session.note("sketch", outcome="skipped_exhausted")
         return False
     skeleton = await _write_skeleton(session)
     if skeleton is None:
@@ -1197,6 +1297,8 @@ class SubmissionAgent:
                 "stage": stage,
                 "rounds": session.rounds,
                 "llm_calls": session.calls,
+                "empty_responses": session.empty_responses,
+                "truncated_responses": session.truncated_responses,
                 "approx_spent_usd": round(session.spent_usd, 6),
                 "models_used": sorted(session.models),
                 "halted_early": session.halted,

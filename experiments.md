@@ -28,8 +28,13 @@ therefore cannot discriminate between scaffolds.
 ## How to run a phase
 
 ```bash
-bash scripts/run_dev8.sh
+bash scripts/run_dev8.sh          # one phase, current configuration
+REPEATS=3 bash scripts/run_phases.sh   # the whole ladder, three samples each
 ```
+
+Eight problems scored once cannot separate a 3 from a 4: in the first ladder
+six of the eight problems flipped at least once across phases. Compare solve
+rates over `REPEATS` samples rather than single outcomes.
 
 The agent's features are cumulative and each is gated by an environment
 variable, so a phase is reproduced by turning the later features off. Nothing
@@ -66,21 +71,66 @@ Practical notes:
 
 ## Results
 
-Score is out of 8. Fill in one row per phase run.
+Regenerate with `.venv/bin/python scripts/phase_report.py`.
 
-| Phase | Score | Spend | Notes |
+### Ladder 1 (2026-09-01/02) — void, kept as a record
+
+| Phase | Score | Spend | Wall |
 | --- | --- | --- | --- |
-| 0 | | | |
-| 1 | | | |
-| 2 | | | |
-| 3 | | | |
-| 4 | | | |
-| 5 | | | |
+| 0 | 1/8 | $0.0959 | 88 min |
+| 1 | 3/8 | $0.2942 | 153 min |
+| 2 | 4/8 | $0.3231 | 199 min |
+| 3 | 4/8 | $0.2805 | 187 min |
+| 4 | 3/8 | $0.3574 | 291 min |
+| 5 | 4/8 | $0.6557 | 700 min |
 
-### Per-problem outcomes
+| Problem | 0 | 1 | 2 | 3 | 4 | 5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `p05_gcd_mersenne` | . | P | P | . | . | P |
+| `p06_pow_mod` | P | . | P | . | P | P |
+| `p08_sum_products` | . | P | P | P | P | P |
+| `putnam_2020_a2` | . | . | P | P | P | . |
+| `p09_imo1964` | . | . | . | P | . | . |
+| `p10_factorial_pow` | . | P | . | P | . | P |
+| `rmo_2000_2` | . | . | . | . | . | . |
+| `rmo_2001_2` | . | . | . | . | . | . |
 
-Totals hide which problems moved, so record the per-problem column for each
-phase. `P` = passed, `.` = failed.
+This ladder does not measure what it was supposed to measure, for two reasons.
+
+**The reasoner was absent.** GPT-OSS returned an empty completion on 74–82% of
+its calls in every phase, always with `finish_reason: length`: at
+`max_tokens=16000` and `effort=high` it spent the whole allowance thinking and
+never began the Lean file. Every stage treated the empty reply as "this model
+declined" and moved on, so the runs are close to Qwen working alone. Answer-first
+is the exception and did work, because naming a number is a short reply that fits.
+
+The clearest casualty is phase 4: across the whole phase the `sketch` stage
+appears in exactly one problem's trace, and in phase 5 not at all, because
+`_write_skeleton` asks GPT-OSS first and returned early every time. Phase 4's
+3/8 is not a measurement of sketch-then-fill.
+
+**One sample cannot resolve one point.** Six of the eight problems flip at
+least once across the ladder, the union of all phases is 6/8, and no single
+phase exceeds 4/8. Phases 1 through 5 (3, 4, 4, 3, 4) are indistinguishable.
+
+Fixes: `DRAFT_MAX_TOKENS` 16000 → 32000, `DEBUG_MAX_TOKENS` 12000 → 24000,
+`FILL_MAX_TOKENS` 3000 → 8000, `REASONER_EFFORT` high → medium with the answer
+stage pinned to high, an empty completion now retried once at lower effort and
+recorded as an `empty_response` trace entry, and a scaffold-health table in
+`phase_report.py` so a stage that never ran is visible next to the score.
+
+### Ladder 2 — after the fixes
+
+| Phase | Runs | Score | Spend | Notes |
+| --- | --- | --- | --- | --- |
+| 0 | | | | |
+| 1 | | | | |
+| 2 | | | | |
+| 3 | | | | |
+| 4 | | | | |
+| 5 | | | | |
+
+Cells below are solves out of repeats.
 
 | Problem | 0 | 1 | 2 | 3 | 4 | 5 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -92,6 +142,9 @@ phase. `P` = passed, `.` = failed.
 | `p10_factorial_pow` | | | | | | |
 | `rmo_2000_2` | | | | | | |
 | `rmo_2001_2` | | | | | | |
+
+Check the health table first: if `Empty` is not near zero, the scores below are
+measuring the same absence again.
 
 ### Reference: solo baselines on these 8 problems
 

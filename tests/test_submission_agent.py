@@ -27,8 +27,9 @@ def fenced(proof: str) -> str:
 
 
 class FakeResponse:
-    def __init__(self, content: str):
+    def __init__(self, content: str, finish_reason: str = "stop"):
         self.content = content
+        self.finish_reason = finish_reason
         self.usage = {"cost": 0.0001}
 
 
@@ -416,6 +417,125 @@ async def test_sketch_stage_can_be_disabled():
     await SubmissionAgent(sketch_config(sketch_fill=False)).solve(problem(), services)
 
     assert "sketch" not in llm.roles_called()
+
+
+# --------------------------------------------------------------------------
+# Empty completions
+#
+# A reasoning model that spends its whole token allowance thinking returns an
+# empty completion. Every stage used to treat that as "this model declined",
+# which removed the reasoner from the portfolio without leaving a trace.
+# --------------------------------------------------------------------------
+
+
+class EffortLLM(RoleLLM):
+    """Returns nothing until the reasoning effort drops to `speaks_at`."""
+
+    def __init__(self, replies, speaks_at: str | None = "medium"):
+        super().__init__(replies)
+        self.speaks_at = speaks_at
+
+    async def complete(self, **kwargs):
+        response = await super().complete(**kwargs)
+        effort = (kwargs.get("reasoning") or {}).get("effort")
+        if effort is not None and effort != self.speaks_at:
+            return FakeResponse("", finish_reason="length")
+        return response
+
+
+@pytest.mark.asyncio
+async def test_an_empty_completion_is_retried_at_lower_effort():
+    llm = EffortLLM({"draft": fenced("simp")}, speaks_at="low")
+    services = FakeServices(llm, FakeLean(("simp",)))
+    result = await SubmissionAgent(sketch_config(answer_first=False)).solve(
+        problem(), services
+    )
+
+    efforts = [(request.get("reasoning") or {}).get("effort") for request in llm.requests]
+    assert efforts == ["medium", "low"]
+    assert result.metadata["stage"] == "solved"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_completion_is_recorded_rather_than_silently_skipped():
+    llm = EffortLLM({"draft": fenced("simp")}, speaks_at=None)
+    services = FakeServices(llm, FakeLean(("simp",)))
+    result = await SubmissionAgent(
+        sketch_config(answer_first=False, max_rounds=1)
+    ).solve(problem(), services)
+
+    empties = [
+        entry for entry in result.metadata["trace"] if entry["stage"] == "empty_response"
+    ]
+    assert empties, "an empty completion must reach the trace"
+    assert all(entry["finish"] == "length" for entry in empties)
+    # Every stage that asked the reasoner for Lean reports its own failure.
+    assert {entry["retry"] for entry in empties} == {0, 1}
+    assert result.metadata["empty_responses"] == len(empties)
+    assert result.metadata["truncated_responses"] == len(empties)
+    assert result.metadata["stage"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_a_portfolio_wave_that_produces_no_lean_says_so():
+    llm = FakeLLM({OSS: ["I could not solve this."], QWEN: [fenced("simp")]})
+    result, _ = await run(Config(portfolio_n=2, max_rounds=1), llm, FakeLean(("simp",)))
+
+    portfolio = next(
+        entry for entry in result.metadata["trace"] if entry["stage"] == "portfolio"
+    )
+    assert portfolio == {
+        "stage": "portfolio",
+        "round": 0,
+        "drafted": 1,
+        "requested": 2,
+        "unusable": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_skeleton_request_that_returns_no_lean_is_visible_in_the_trace():
+    llm = RoleLLM({
+        "draft": fenced("ring"),
+        "debug": fenced("ring"),
+        "escalate": fenced("ring"),
+        "sketch": "I cannot decompose this.",
+    })
+    services = FakeServices(llm, SorryAwareLean())
+    result = await SubmissionAgent(sketch_config(max_rounds=1)).solve(problem(), services)
+
+    outcomes = [
+        entry.get("outcome")
+        for entry in result.metadata["trace"]
+        if entry["stage"] == "sketch"
+    ]
+    assert outcomes == ["no_lean_block", "no_lean_block"]
+
+
+@pytest.mark.asyncio
+async def test_the_answer_stage_thinks_harder_than_the_drafting_stage():
+    """Short prose replies can afford full effort; whole Lean files cannot."""
+
+    llm = RoleLLM({"answer": "ANSWER: p05_answer = 7", "draft": fenced("simp")})
+    services = FakeServices(llm, FakeLean(("simp",)))
+    await SubmissionAgent(Config(portfolio_n=1, sketch_fill=False)).solve(
+        Problem(
+            id="p",
+            description="d",
+            challenge="import Mathlib\n\nabbrev p05_answer : \u2115 := 7\n\ntheorem p : p05_answer = 7 := by\n  sorry\n",
+        ),
+        services,
+    )
+
+    efforts = {
+        role_of(request["messages"][0]["content"]): (request.get("reasoning") or {}).get(
+            "effort"
+        )
+        for request in llm.requests
+        if request["model"] == OSS
+    }
+    assert efforts["answer"] == "high"
+    assert efforts["draft"] == "medium"
 
 
 @pytest.mark.asyncio
